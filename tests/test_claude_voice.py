@@ -1,10 +1,14 @@
 import unittest
 import sys
 import os
+import json
+import time
+import shlex
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from claude_voice import parse_key_spec, KeyMatcher, parse_voice_commands
+from claude_voice import parse_key_spec, KeyMatcher, parse_voice_commands, parse_json_response, WorkerManager
 from transcribe_worker import is_junk_segment
 
 class TestClaudeVoice(unittest.TestCase):
@@ -75,6 +79,85 @@ class TestClaudeVoice(unittest.TestCase):
         self.assertTrue(is_junk_segment("hello", -1.5, 0.1))
         self.assertTrue(is_junk_segment("hello", -0.5, 0.8))
         self.assertFalse(is_junk_segment("run pytest please", -0.2, 0.05))
+
+    def test_parse_json_response(self):
+        self.assertEqual(parse_json_response('{"text": "hello"}'), "hello")
+        with self.assertRaises(RuntimeError):
+            parse_json_response('{"error": "bad"}')
+        with self.assertRaises(ValueError):
+            parse_json_response('invalid json')
+
+    def test_worker_manager_ready_handshake(self):
+        script = "import sys; print('READY', flush=True)\nfor line in sys.stdin: pass"
+        cmd = f"{sys.executable} -c {shlex.quote(script)}"
+        os.environ['CLAUDE_VOICE_WORKER_CMD'] = cmd
+        wm = WorkerManager()
+        try:
+            wm.start()
+            self.assertTrue(wm.wait_ready(timeout=5.0))
+        finally:
+            wm.shutdown()
+            os.environ.pop('CLAUDE_VOICE_WORKER_CMD', None)
+
+    def test_worker_manager_normal_reply(self):
+        script = "import sys, json; print('READY', flush=True); line=sys.stdin.readline(); print(json.dumps({'text': 'unit test success'}), flush=True)\nfor line in sys.stdin: pass"
+        cmd = f"{sys.executable} -c {shlex.quote(script)}"
+        os.environ['CLAUDE_VOICE_WORKER_CMD'] = cmd
+        wm = WorkerManager()
+        try:
+            wm.start()
+            res = wm.transcribe("fake.wav")
+            self.assertEqual(res, "unit test success")
+        finally:
+            wm.shutdown()
+            os.environ.pop('CLAUDE_VOICE_WORKER_CMD', None)
+
+    def test_worker_manager_error_reply(self):
+        script = "import sys, json; print('READY', flush=True); line=sys.stdin.readline(); print(json.dumps({'error': 'transcription failed'}), flush=True)\nfor line in sys.stdin: pass"
+        cmd = f"{sys.executable} -c {shlex.quote(script)}"
+        os.environ['CLAUDE_VOICE_WORKER_CMD'] = cmd
+        wm = WorkerManager()
+        try:
+            wm.start()
+            with self.assertRaises(RuntimeError):
+                wm.transcribe("fake.wav")
+        finally:
+            wm.shutdown()
+            os.environ.pop('CLAUDE_VOICE_WORKER_CMD', None)
+
+    def test_worker_manager_worker_dying_mid_request(self):
+        fd, state_path = tempfile.mkstemp()
+        os.close(fd)
+        with open(state_path, "w") as f:
+            f.write("0")
+
+        script = f"""
+import sys, json, os
+print('READY', flush=True)
+line = sys.stdin.readline()
+path = {repr(state_path)}
+with open(path, 'r') as f:
+    count = int(f.read().strip())
+with open(path, 'w') as f:
+    f.write(str(count + 1))
+if count == 0:
+    sys.exit(1)
+else:
+    print(json.dumps({{'text': 'recovered text'}}), flush=True)
+for line in sys.stdin: pass
+"""
+        cmd = f"{sys.executable} -c {shlex.quote(script)}"
+        os.environ['CLAUDE_VOICE_WORKER_CMD'] = cmd
+        wm = WorkerManager()
+        try:
+            wm.start()
+            res = wm.transcribe("fake.wav")
+            self.assertEqual(res, "recovered text")
+        finally:
+            wm.shutdown()
+            os.environ.pop('CLAUDE_VOICE_WORKER_CMD', None)
+            if os.path.exists(state_path):
+                os.remove(state_path)
 
 if __name__ == '__main__':
     unittest.main()

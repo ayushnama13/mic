@@ -13,6 +13,8 @@ import time
 import tempfile
 import wave
 import re
+import json
+import shlex
 
 def parse_key_spec(spec):
     if not spec:
@@ -139,6 +141,161 @@ def ring_bell():
     except Exception:
         pass
 
+def parse_json_response(line):
+    try:
+        data = json.loads(line.strip())
+    except Exception as e:
+        raise ValueError(f"Invalid JSON response: {line} ({e})")
+    if "error" in data:
+        raise RuntimeError(f"Worker error: {data['error']}")
+    if "text" in data:
+        return data["text"]
+    raise ValueError(f"Unknown response format: {data}")
+
+class WorkerManager:
+    def __init__(self):
+        self.proc = None
+        self.ready_event = threading.Event()
+        self.lock = threading.Lock()
+        self.stderr_file = None
+        self.closing = False
+
+    def start(self):
+        with self.lock:
+            self._start_unlocked()
+
+    def _start_unlocked(self):
+        if self.closing:
+            raise RuntimeError("worker is shutting down")
+        if self.proc and self.proc.poll() is None:
+            return
+        self.ready_event.clear()
+        set_title("[loading model] claude")
+        cmd_env = os.environ.get('CLAUDE_VOICE_WORKER_CMD')
+        if cmd_env:
+            cmd = shlex.split(cmd_env)
+        else:
+            python_exec = "/home/ayush/vscoder/Documents/vscode/transcriber/.venv/bin/python"
+            worker_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcribe_worker.py")
+            cmd = [python_exec, worker_script, '--serve']
+
+        cache_dir = os.path.expanduser("~/.cache/claude-voice")
+        os.makedirs(cache_dir, exist_ok=True)
+        log_path = os.path.join(cache_dir, "worker.log")
+        try:
+            self.stderr_file = open(log_path, "a", encoding="utf-8")
+        except Exception:
+            self.stderr_file = subprocess.DEVNULL
+
+        try:
+            self.proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=self.stderr_file,
+                text=True
+            )
+        except Exception as e:
+            log_error(f"Failed to start worker: {e}")
+            set_title("claude")
+            raise
+
+        def reader_thread():
+            try:
+                while self.proc and self.proc.stdout:
+                    line = self.proc.stdout.readline()
+                    if not line:
+                        break
+                    stripped = line.strip()
+                    if stripped == "READY":
+                        self.ready_event.set()
+                        set_title("claude")
+                        break
+                    else:
+                        log_error(f"Worker stdout: {stripped}")
+            except Exception as e:
+                log_error(f"Worker reader error: {e}")
+            finally:
+                set_title("claude")
+
+        threading.Thread(target=reader_thread, daemon=True).start()
+
+    def wait_ready(self, timeout=180.0):
+        return self.ready_event.wait(timeout=timeout)
+
+    def shutdown(self):
+        # no lock: an in-flight transcribe() holds it for up to minutes; closing the
+        # worker's stdin makes it exit and unblocks that call
+        self.closing = True
+        self._shutdown_unlocked()
+
+    def _shutdown_unlocked(self):
+        if not self.proc:
+            return
+        try:
+            if self.proc.stdin:
+                try:
+                    self.proc.stdin.close()
+                except Exception:
+                    pass
+            self.proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=1.0)
+            except Exception:
+                pass
+        except Exception:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+        self.proc = None
+        self.ready_event.clear()
+        if self.stderr_file and not isinstance(self.stderr_file, int):
+            try:
+                self.stderr_file.close()
+            except Exception:
+                pass
+        self.stderr_file = None
+
+    def transcribe(self, wav_path):
+        with self.lock:
+            if not self.proc or self.proc.poll() is not None:
+                self._start_unlocked()
+
+            if not self.ready_event.wait(timeout=180.0):
+                raise RuntimeError("Worker failed to become ready (timeout)")
+
+            try:
+                self.proc.stdin.write(wav_path + "\n")
+                self.proc.stdin.flush()
+                line = self.proc.stdout.readline()
+                if not line:
+                    raise EOFError("Worker closed stdout")
+                data = json.loads(line.strip())
+            except Exception as e:
+                log_error(f"Worker communication error: {e}. Respawning worker.")
+                self._shutdown_unlocked()
+                self._start_unlocked()
+                if not self.ready_event.wait(timeout=180.0):
+                    raise RuntimeError("Worker failed to become ready after respawn")
+                try:
+                    self.proc.stdin.write(wav_path + "\n")
+                    self.proc.stdin.flush()
+                    line = self.proc.stdout.readline()
+                    if not line:
+                        raise EOFError("Worker closed stdout after respawn")
+                    data = json.loads(line.strip())
+                except Exception as ex:
+                    raise RuntimeError(f"Worker failed after respawn: {ex}")
+
+            if "error" in data:
+                raise RuntimeError(f"Worker error: {data['error']}")
+            if "text" in data:
+                return data["text"]
+            raise ValueError(f"Unknown response format: {data}")
+
 def main():
     key_spec = os.environ.get('CLAUDE_VOICE_KEY', 'F9')
     target_key = parse_key_spec(key_spec)
@@ -146,7 +303,6 @@ def main():
 
     cmd_env = os.environ.get('CLAUDE_VOICE_CMD')
     if cmd_env:
-        import shlex
         child_cmd = shlex.split(cmd_env)
     else:
         child_cmd = ['claude'] + sys.argv[1:]
@@ -182,6 +338,17 @@ def main():
     signal.signal(signal.SIGWINCH, handle_sigwinch)
     handle_sigwinch(None, None)
 
+    worker_manager = WorkerManager()
+    worker_manager.start()
+
+    def handle_shutdown(signum, frame):
+        if worker_manager:
+            worker_manager.shutdown()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGHUP, handle_shutdown)
+
     recorder = Recorder()
     recording = False
     matcher = KeyMatcher(target_key)
@@ -214,24 +381,33 @@ def main():
                 wf.setframerate(16000)
                 wf.writeframes(pcm_bytes)
 
-            python_exec = "/home/ayush/vscoder/Documents/vscode/transcriber/.venv/bin/python"
-            worker_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcribe_worker.py")
+            text = None
+            try:
+                text = worker_manager.transcribe(wav_path)
+            except Exception as e:
+                log_error(f"Worker transcription failed, falling back to one-shot: {e}")
+                # Last resort fallback to one-shot subprocess
+                try:
+                    python_exec = "/home/ayush/vscoder/Documents/vscode/transcriber/.venv/bin/python"
+                    worker_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcribe_worker.py")
+                    res = subprocess.run([python_exec, worker_script, wav_path], capture_output=True, text=True, timeout=60)
+                    if res.returncode == 0:
+                        text = res.stdout.strip()
+                    else:
+                        log_error(f"One-shot fallback failed: {res.stderr}")
+                except Exception as ex:
+                    log_error(f"One-shot fallback exception: {ex}")
 
-            res = subprocess.run([python_exec, worker_script, wav_path], capture_output=True, text=True, timeout=60)
-            if res.returncode == 0:
-                text = res.stdout.strip()
-                if text:
-                    text_clean, send_enter, keep = parse_voice_commands(text)
-                    if keep and text_clean:
-                        payload = b'\x1b[200~' + text_clean.encode('utf-8') + b'\x1b[201~'
-                        try:
-                            os.write(pty_fd, payload)
-                            if send_enter:
-                                os.write(pty_fd, b'\r')
-                        except Exception as e:
-                            log_error(f"Failed to write to pty: {e}")
-            else:
-                log_error(f"transcribe_worker failed: {res.stderr}")
+            if text:
+                text_clean, send_enter, keep = parse_voice_commands(text)
+                if keep and text_clean:
+                    payload = b'\x1b[200~' + text_clean.encode('utf-8') + b'\x1b[201~'
+                    try:
+                        os.write(pty_fd, payload)
+                        if send_enter:
+                            os.write(pty_fd, b'\r')
+                    except Exception as e:
+                        log_error(f"Failed to write to pty: {e}")
         except Exception as e:
             log_error(f"Transcription error: {e}")
         finally:
@@ -317,6 +493,8 @@ def main():
             exit_code = 0
         sys.exit(exit_code if exit_code >= 0 else 128 - exit_code)
     finally:
+        if worker_manager:
+            worker_manager.shutdown()
         if has_raw and old_term is not None:
             try:
                 termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_term)

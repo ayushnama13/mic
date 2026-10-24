@@ -4,6 +4,8 @@ import sys
 import ctypes
 import glob
 import site
+import gc
+import json
 
 def _preload_cuda_libs():
     """CTranslate2 dlopens libcublas.so.12/libcudnn*.so.9 by name; pip nvidia-* wheels
@@ -52,15 +54,32 @@ def load_hotwords():
         print(f"Error loading terms.txt: {e}", file=sys.stderr)
         return None
 
+def transcribe_audio(model, audio_path, hotwords):
+    if not os.path.exists(audio_path):
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
+    segments, info = model.transcribe(
+        audio_path,
+        language="en",
+        beam_size=1,
+        vad_filter=True,
+        condition_on_previous_text=False,
+        hotwords=hotwords
+    )
+    texts = []
+    for s in segments:
+        if is_junk_segment(s.text, s.avg_logprob, s.no_speech_prob):
+            continue
+        t = s.text.strip()
+        if t:
+            texts.append(t)
+    return " ".join(texts)
+
 def main():
     if len(sys.argv) < 2:
-        print("Usage: transcribe_worker.py <audio.wav>", file=sys.stderr)
+        print("Usage: transcribe_worker.py <audio.wav> or --serve", file=sys.stderr)
         sys.exit(1)
 
-    audio_path = sys.argv[1]
-    if not os.path.exists(audio_path):
-        print(f"Audio file not found: {audio_path}", file=sys.stderr)
-        sys.exit(1)
+    mode = sys.argv[1]
 
     _preload_cuda_libs()
     try:
@@ -79,27 +98,32 @@ def main():
 
     hotwords = load_hotwords()
 
-    try:
-        segments, info = model.transcribe(
-            audio_path,
-            language="en",
-            beam_size=1,
-            vad_filter=True,
-            condition_on_previous_text=False,
-            hotwords=hotwords
-        )
-        texts = []
-        for s in segments:
-            if is_junk_segment(s.text, s.avg_logprob, s.no_speech_prob):
-                continue
-            t = s.text.strip()
-            if t:
-                texts.append(t)
-        final_text = " ".join(texts)
-        print(final_text, flush=True)
-    except Exception as e:
-        print(f"Transcription error: {e}", file=sys.stderr)
-        sys.exit(1)
+    if mode == '--serve':
+        print("READY", flush=True)
+        try:
+            for line in sys.stdin:
+                audio_path = line.strip()
+                if not audio_path:
+                    continue
+                try:
+                    text = transcribe_audio(model, audio_path, hotwords)
+                    print(json.dumps({"text": text}), flush=True)
+                except Exception as e:
+                    print(json.dumps({"error": str(e)}), flush=True)
+        except Exception as e:
+            print(f"Serve loop error: {e}", file=sys.stderr)
+        finally:
+            del model
+            gc.collect()
+            sys.exit(0)
+    else:
+        audio_path = mode
+        try:
+            text = transcribe_audio(model, audio_path, hotwords)
+            print(text, flush=True)
+        except Exception as e:
+            print(f"Transcription error: {e}", file=sys.stderr)
+            sys.exit(1)
 
 if __name__ == "__main__":
     main()
